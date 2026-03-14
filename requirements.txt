@@ -1,0 +1,7 @@
+datasets
+huggingface_hub
+pandas
+sentence-transformers
+torch
+transformers
+python-dotenv

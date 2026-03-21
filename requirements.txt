@@ -5,3 +5,8 @@ sentence-transformers
 torch
 transformers
 python-dotenv
+
+numpy
+matplotlib
+seaborn
+scipy

@@ -36,13 +36,17 @@ except Exception as e:
 class EvalConfig:
     INPUT_PARQUET: str = "./data/Confidence_calibration_study_dataset.parquet"
     OUTPUT_DIR: str = "./results/"
-    CHECKPOINT_DIR: str = "./results/checkpoints/"
       
     BATCH_SIZE: int = 16
     MAX_NEW_TOKENS: int = 128
-    TEMPERATURE: float = 0.3
+    TEMPERATURE: float = 0.5
     DO_SAMPLE: bool = True
     TOP_P: float = 0.9
+
+    MIN_BATCH_SIZE: int = 1
+    TOP_K: int = 50
+    MAX_RETRIES: int = 3
+    SKIP_ON_REPEATED_FAILURE: bool = True
     
     EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
     SIMILARITY_THRESHOLD: float = 0.65
@@ -51,29 +55,27 @@ class EvalConfig:
     PRIMARY_GPU: int = 0
     SECONDARY_GPU: int = 1
     
-    CHECKPOINT_EVERY: int = 100
-    RESUME_FROM_CHECKPOINT: bool = True
-    
-    SAVE_INTERMEDIATE: bool = False
+    SAVE_INTERMEDIATE: bool = True
     COMPRESS_OUTPUT: bool = True
 
     MODELS: List[str] = field(default_factory=lambda: [
+            "meta-llama/Llama-3.2-1B",
+            "google/gemma-7b-it",
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             "Qwen/Qwen3.5-9B",
             "mistralai/Mistral-7B-Instruct-v0.3",
-            "meta-llama/Llama-3.1-8B-Instruct",
             "Qwen/Qwen2-1.5B-Instruct",
-            "google/gemma-3-12b-it",
-            "google/gemma-7b-it",
-            "microsoft/Phi-4-mini-instruct",
-            "meta-llama/Llama-3.2-1B",
-            "microsoft/phi-4",
             "HuggingFaceH4/zephyr-7b-beta",
             "deepseek-ai/deepseek-llm-7b-chat"
+
+            # Below are the models which are not evaluated due to kaggle free tier limitation
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "microsoft/Phi-4-mini-instruct",
+            "microsoft/phi-4",
+            "google/gemma-3-12b-it",
         ])
     def __post_init__(self):
         Path(self.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-        Path(self.CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
 
 config = EvalConfig()
 
@@ -274,11 +276,20 @@ class AnswerEvaluator:
         
         return 0
 
+def delete_model_cache(model_name: str):
+    """Delete downloaded model files to save HDD space"""
+    cache_dir = Path(os.getenv('HF_HOME', os.path.expanduser('~/.cache/huggingface/hub')))
+    model_slug = model_name.replace('/', '--')
+    
+    for path in cache_dir.rglob(f'*{model_slug}*'):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
 class OptimizedInference:
     
     def __init__(self, model_name: str):
         self.model_name = model_name
-        
+        self.current_batch_size = config.BATCH_SIZE
         print(f"\nLoading {model_name}...")
         
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -299,7 +310,7 @@ class OptimizedInference:
         
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.float16,
+            dtype=torch.bfloat16,
             device_map=device_map,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
@@ -326,32 +337,56 @@ class OptimizedInference:
             max_length=2048
         )
         inputs = {k: v.to(f"cuda:{config.PRIMARY_GPU}") for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=config.MAX_NEW_TOKENS,
-                do_sample=config.DO_SAMPLE,
-                temperature=config.TEMPERATURE,
-                top_p=config.TOP_P,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True
-            )
-        
-        responses = []
-        for i, output in enumerate(outputs):
-            new_tokens = output[inputs['input_ids'][i].shape[0]:]
-            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            responses.append(response)
-        
-        return responses
-    
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=config.MAX_NEW_TOKENS,
+                    do_sample=config.DO_SAMPLE,
+                    temperature=config.TEMPERATURE,
+                    top_p=config.TOP_P,
+                    top_k=config.TOP_K,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                    renormalize_logits=True,
+                    output_scores=False,
+                )
+            
+            responses = []
+            for i, output in enumerate(outputs):
+                new_tokens = output[inputs['input_ids'][i].shape[0]:]
+                response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+                responses.append(response)
+            
+            return responses
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                self.current_batch_size = max(config.MIN_BATCH_SIZE, self.current_batch_size // 2)
+                print(f"  ⚠ OOM - Reduced batch size to {self.current_batch_size}")
+                raise
+            else:
+                raise
     def cleanup(self):
-        del self.model
-        del self.tokenizer
+        try:
+            del self.model
+            del self.tokenizer
+        except:
+            pass
         gc.collect()
         torch.cuda.empty_cache()
+    
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        
+        for _ in range(3):
+            gc.collect()
+        delete_model_cache(self.model_name)
+        time.sleep(2)
         print(f"✓ Cleaned up")
 
 @dataclass
@@ -369,60 +404,10 @@ class QuestionResult:
     def to_dict(self) -> Dict:
         return asdict(self)
 
-class CheckpointManager:
-    
-    def __init__(self, model_name: str, checkpoint_dir: str):
-        self.model_name = model_name.replace('/', '_')
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_path = self.checkpoint_dir / f"{self.model_name}_checkpoint.json"
-        self.results_path = self.checkpoint_dir / f"{self.model_name}_results.parquet"
-    
-    def save_checkpoint(self, question_idx: int, results: List[QuestionResult]):
-        checkpoint = {
-            "model": self.model_name,
-            "last_question_idx": question_idx,
-            "total_results": len(results),
-            "timestamp": time.time()
-        }
-        
-        with open(self.checkpoint_path, 'w') as f:
-            json.dump(checkpoint, f)
-        
-        if results:
-            df = pd.DataFrame([r.to_dict() for r in results])
-            df.to_parquet(self.results_path)
-    
-    def load_checkpoint(self) -> Tuple[int, List[QuestionResult]]:
-        if not self.checkpoint_path.exists():
-            return 0, []
-        
-        try:
-            with open(self.checkpoint_path, 'r') as f:
-                checkpoint = json.load(f)
-            
-            if self.results_path.exists():
-                df = pd.read_parquet(self.results_path)
-                results = [QuestionResult(**row) for _, row in df.iterrows()]
-            else:
-                results = []
-            
-            print(f"✓ Resumed from checkpoint: question {checkpoint['last_question_idx']}")
-            return checkpoint['last_question_idx'], results
-        except Exception as e:
-            print(f"⚠ Checkpoint load failed: {e}")
-            return 0, []
-    
-    def clear_checkpoint(self):
-        if self.checkpoint_path.exists():
-            self.checkpoint_path.unlink()
-        if self.results_path.exists():
-            self.results_path.unlink()
-
 def evaluate_model(
     model_name: str,
     questions_df: pd.DataFrame,
     evaluator: AnswerEvaluator,
-    checkpoint_manager: CheckpointManager
 ) -> pd.DataFrame:
     """Evaluate model"""
     
@@ -430,32 +415,58 @@ def evaluate_model(
     print(f"EVALUATING: {model_name}")
     print(f"{'='*80}")
     
-    start_idx, existing_results = (0, []) if not config.RESUME_FROM_CHECKPOINT else checkpoint_manager.load_checkpoint()
-    
     inference = OptimizedInference(model_name)
     
     questions = questions_df.to_dict('records')
     total_questions = len(questions)
-    results = existing_results
-    batch_size = config.BATCH_SIZE
+    results = []
     
-    pbar = tqdm(total=total_questions, initial=start_idx, desc=f"Evaluating")
-    
-    for batch_start in range(start_idx, total_questions, batch_size):
+    pbar = tqdm(total=total_questions, desc=f"Processing", ascii=True)
+    batch_start = 0
+    while batch_start < total_questions:
+        batch_size = inference.current_batch_size 
         batch_end = min(batch_start + batch_size, total_questions)
         batch = questions[batch_start:batch_end]
         
         prompts = [build_optimized_prompt(q['question'], q['type']) for q in batch]
         
-        start_time = time.time()
-        try:
-            responses = inference.generate_batch(prompts)
-            inference_time = (time.time() - start_time) / len(batch)
-        except Exception as e:
-            print(f"\n⚠ Batch {batch_start}-{batch_end} failed: {e}")
-            pbar.update(len(batch))
+        inference_time = None
+        retry_count = 0
+        success = False
+        while retry_count < config.MAX_RETRIES and not success:
+            try:
+                start_time = time.time()
+                responses = inference.generate_batch(prompts)
+                success = True
+                inference_time = (time.time() - start_time) / len(batch)
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    retry_count += 1
+                    if retry_count >= config.MAX_RETRIES:
+                        if config.SKIP_ON_REPEATED_FAILURE:
+                            print(f"  ✗ Skipping batch {batch_start}-{batch_end}")
+                            break
+                        else:
+                            break
+
+                    torch.cuda.empty_cache()
+                    time.sleep(2)
+                    
+                    mid = len(batch) // 2
+                    if mid == 0:
+                        break
+                    batch = batch[:mid]
+                    prompts = prompts[:mid]
+                    batch_end = batch_start + mid
+                else:
+                    raise
+                
+        if not success:
+            pbar.update(batch_end - batch_start)
+            batch_start = batch_end
             continue
-        
+            
         for question, response in zip(batch, responses):
             pred, conf = parse_response_robust(response)
             
@@ -481,18 +492,18 @@ def evaluate_model(
                 inference_time=inference_time
             ))
         
-        pbar.update(len(batch))
-        
-        if (batch_end % config.CHECKPOINT_EVERY == 0) or (batch_end == total_questions):
-            checkpoint_manager.save_checkpoint(batch_end, results)
+        pbar.update(batch_end - batch_start)
+        batch_start = batch_end
     
     pbar.close()
     inference.cleanup()
     
     results_df = pd.DataFrame([r.to_dict() for r in results])
     
-    print(f"\n✓ Complete")  
-    checkpoint_manager.clear_checkpoint()
+    print(f'\n✓ Complete: {len(results_df)} predictions')
+    print(f'  Parse: {results_df["parse_success"].mean():.1%}')
+    print(f'  Accuracy: {results_df["correct"].mean():.3f}')
+    print(f'  Avg confidence: {results_df["confidence"].mean():.3f}') 
     return results_df
 
 def main():
@@ -506,12 +517,8 @@ def main():
         print(f"{'='*80}")
         
         try:
-            checkpoint_mgr = CheckpointManager(model_name, config.CHECKPOINT_DIR)
-            
-            results_df = evaluate_model(model_name, questions_df, evaluator, checkpoint_mgr)
-
+            results_df = evaluate_model(model_name, questions_df, evaluator)
             all_results.append(results_df)
-
             if config.SAVE_INTERMEDIATE:
                 model_short = model_name.replace('/', '_')
                 output_path = f"{config.OUTPUT_DIR}{model_short}_results.csv"
@@ -530,14 +537,13 @@ def main():
         
         finally:
             gc.collect()
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except:
+                pass
             time.sleep(5)
             
     if all_results:
-        print(f"\n{'='*80}")
-        print("COMBINING RESULTS")
-        print(f"{'='*80}")
-        
         combined_df = pd.concat(all_results, ignore_index=True)
         
         # Save combined results
@@ -549,11 +555,6 @@ def main():
             combined_df.to_csv(final_path, index=False)
         
         print(f"✓ Saved combined results: {final_path}")
-        print(f"\nFinal Statistics:")
-        print(f"  Total predictions: {len(combined_df)}")
-        print(f"  Models evaluated: {combined_df['model'].nunique()}")
-        print(f"  Overall accuracy: {combined_df['correct'].mean():.3f}")
-        print(f"  Parse success rate: {combined_df['parse_success'].mean()*100:.1f}%")
         
         # Per-model summary
         print(f"\nPer-Model Summary:")
@@ -581,5 +582,5 @@ def main():
         print("\n✗ No results generated")
         return None
 
-torch.manual_seed(62)
+torch.manual_seed(52)
 main()

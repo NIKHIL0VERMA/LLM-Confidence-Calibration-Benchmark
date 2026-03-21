@@ -31,18 +31,23 @@ While LLMs can produce highly confident responses, their confidence does not alw
 This repository is designed to be fully reproducible on Kaggle as well as locally while maintaining all source code and analysis in one organized place.
 
 ```shell
-├── notebooks/
-│   ├── 01_dataset_creation.ipynb     # Extracts and prepares reference datasets
-│   ├── 02_model_evaluation.ipynb     # Runs LLM inference & confidence extraction
-│   └── 03_analysis_visualization.ipynb # Computes calibration metrics & creates plots
-├── data/                             # Processed Parquet/CSV files 
-│   ├── Confidence_calibration_study_dataset.csv
-│   └── Confidence_calibration_study_dataset.parquet
-├── results/                          # LLM Inference & Confidence Extraction Results
-├── outputs/                          # Output figures, reliability diagrams, and tables
-├── src/                              # Reusable Python scripts for local replication
+├── data/                             # Processed Parquet/CSV datasets 
+├── notebooks/                        # Kaggle notebooks for full pipeline execution
+│   ├── 01_dataset_creation.ipynb
+│   ├── 02_model_evaluation.ipynb
+│   └── 03_analysis_visualization.ipynb
+├── outputs/                          # Final generated outputs
+│   ├── calibration_study_complete.zip
+│   ├── csv_tables/                   # Aggregated metrics and ECE breakdowns
+│   └── figures/                      # Visualizations (heatmaps, reliability diagrams)
+├── results/                          # Raw evaluation inference outputs (.csv.gz files)
+├── src/                              # Executable Python scripts for local pipeline
+│   ├── 01_dataset_creation.py
+│   ├── 02_model_evaluation.py
+│   └── 03_analysis_visualization.py
+├── .env.example                      # Template for environment variables
 ├── README.md
-└── requirements.txt                  # Dependencies needed for local replication
+└── requirements.txt                  # Python dependencies
 ```
 
 ## 📊 Datasets & Findings
@@ -98,7 +103,12 @@ You can also run the evaluation pipeline locally using the extracted Python scri
 ### Prerequisites
 
 1. Clone the repository and navigate into it.
-2. Install the required dependencies:
+2. **Set up a Virtual Environment (Recommended):**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+   ```
+3. Install the required dependencies:
    ```bash
    pip install -r requirements.txt
    ```
